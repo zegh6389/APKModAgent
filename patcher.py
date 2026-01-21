@@ -571,6 +571,15 @@ def apply_mods(decode_dir):
     with open(launcher_path, "r") as f:
         content = f.read()
 
+    # --- FIX: REMOVE OLD GETMODPC CALLS ---
+    # The previous mod likely injected a call like: invoke-static {p0}, Lcom/GETMODPC/A;->...(Landroid/content/Context;)V
+    # We must remove it to prevent ClassNotFoundException
+    if "Lcom/GETMODPC" in content:
+        logger.info("Removing old GETMODPC references from LauncherActivity...")
+        # Regex to remove lines with Lcom/GETMODPC
+        # This removes the entire line containing the reference
+        content = re.sub(r".*Lcom\/GETMODPC.*", "", content)
+
     # Regex to find the onCreate method
     # .method ... onCreate(Landroid/os/Bundle;)V ... (code) ... return-void .end method
     
