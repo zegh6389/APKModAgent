@@ -29,22 +29,40 @@ UPDATER_SMALI = """
     return-void
 .end method
 
+
 .method public static check(Landroid/content/Context;)V
     .locals 6
     .param p0, "context"    # Landroid/content/Context;
 
     .prologue
-    .line 22
+    # --- FIRST RUN GREETING CHECK ---
     const-string v2, "update_prefs"
-
     const/4 v3, 0x0
-
     invoke-virtual {p0, v2, v3}, Landroid/content/Context;->getSharedPreferences(Ljava/lang/String;I)Landroid/content/SharedPreferences;
-
     move-result-object v0
 
-    .line 23
-    .local v0, "prefs":Landroid/content/SharedPreferences;
+    const-string v2, "has_greeted"
+    invoke-interface {v0, v2, v3}, Landroid/content/SharedPreferences;->getBoolean(Ljava/lang/String;Z)Z
+    move-result v2
+
+    if-nez v2, :cond_welcome
+
+    # Show Welcome Dialog
+    const-string v2, "https://t.me/YourTelegramChannel"
+    invoke-static {p0, v2}, Lcom/myupdate/Updater;->showWelcomeDialog(Landroid/content/Context;Ljava/lang/String;)V
+
+    # Save preference
+    invoke-interface {v0}, Landroid/content/SharedPreferences;->edit()Landroid/content/SharedPreferences$Editor;
+    move-result-object v2
+    const-string v3, "has_greeted"
+    const/4 v4, 0x1
+    invoke-interface {v2, v3, v4}, Landroid/content/SharedPreferences$Editor;->putBoolean(Ljava/lang/String;Z)Landroid/content/SharedPreferences$Editor;
+    move-result-object v2
+    invoke-interface {v2}, Landroid/content/SharedPreferences$Editor;->apply()V
+
+    :cond_welcome
+
+    # --- UPDATE CHECK CHECK ---
     const-string v2, "last_check_time"
 
     const-wide/16 v4, 0x0
@@ -147,10 +165,38 @@ UPDATER_SMALI = """
 
     invoke-virtual {v0, v1, v2}, Landroid/app/AlertDialog$Builder;->setPositiveButton(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;
 
-    .line 43
-    invoke-virtual {v0}, Landroid/app/AlertDialog$Builder;->show()Landroid/app/AlertDialog;
-
     .line 44
+    return-void
+.end method
+
+.method public static showWelcomeDialog(Landroid/content/Context;Ljava/lang/String;)V
+    .locals 3
+    .param p0, "context"    # Landroid/content/Context;
+    .param p1, "url"    # Ljava/lang/String;
+
+    .prologue
+    new-instance v0, Landroid/app/AlertDialog$Builder;
+    invoke-direct {v0, p0}, Landroid/app/AlertDialog$Builder;-><init>(Landroid/content/Context;)V
+
+    const-string v1, "Welcome!"
+    invoke-virtual {v0, v1}, Landroid/app/AlertDialog$Builder;->setTitle(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;
+
+    const-string v1, "Thanks for using our Mod. Join us on Telegram for updates!"
+    invoke-virtual {v0, v1}, Landroid/app/AlertDialog$Builder;->setMessage(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;
+
+    const/4 v1, 0x1
+    invoke-virtual {v0, v1}, Landroid/app/AlertDialog$Builder;->setCancelable(Z)Landroid/app/AlertDialog$Builder;
+
+    const-string v1, "Join Telegram"
+    new-instance v2, Lcom/myupdate/Updater$1;
+    invoke-direct {v2, p1, p0}, Lcom/myupdate/Updater$1;-><init>(Ljava/lang/String;Landroid/content/Context;)V
+    invoke-virtual {v0, v1, v2}, Landroid/app/AlertDialog$Builder;->setPositiveButton(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;
+
+    const-string v1, "Close"
+    const/4 v2, 0x0
+    invoke-virtual {v0, v1, v2}, Landroid/app/AlertDialog$Builder;->setNegativeButton(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;
+
+    invoke-virtual {v0}, Landroid/app/AlertDialog$Builder;->show()Landroid/app/AlertDialog;
     return-void
 .end method
 """
