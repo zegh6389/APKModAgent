@@ -1,6 +1,10 @@
 # AI APK Modification Agent & deployment
 
+**Current version:** 1.10
+
 This project is a containerized automation tool designed to modify the SoundCloud APK. It rips out the existing modification logic and injects a custom Telegram-based update checker using Smali injection.
+
+For a summary of changes per version, see [`docs/version.md`](docs/version.md).
 
 ## Project Overview
 
