@@ -1,5 +1,7 @@
 # patcher.py Documentation
 
+**Applies to version:** 1.10
+
 **Purpose**:  
 Handles the specific logic for modifying the source code of the SoundCloud APK. It acts as the "intelligence" that knows *what* to change, whereas `agent.py` knows *how* to build it.
 

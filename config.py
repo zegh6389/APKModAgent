@@ -35,3 +35,11 @@ UPDATE_DIALOG_MESSAGE = os.getenv(
     "UPDATE_DIALOG_MESSAGE",
     "A new version is available. check our telegram channel",
 )
+
+# Behaviour flags controlling how aggressively we strip third‑party mods and
+# whether we inject our own updater logic. All are environment driven so you
+# can tweak behaviour per deployment without changing code.
+
+STRIP_GETMODPC = os.getenv("STRIP_GETMODPC", "1") == "1"
+
+ENABLE_UPDATER = os.getenv("ENABLE_UPDATER", "1") == "1"

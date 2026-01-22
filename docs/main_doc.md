@@ -1,5 +1,7 @@
 # main.py Documentation
 
+**Applies to version:** 1.10
+
 **Purpose**:  
 Serves as the HTTP entry point for the application. It utilizes the **FastAPI** framework to expose a REST API that accepts APK file uploads and initiates the modification process.
 

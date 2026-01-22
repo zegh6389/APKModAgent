@@ -2,10 +2,13 @@ import os
 import shutil
 import re
 import logging
+import xml.etree.ElementTree as ET
 
 import config
 
 logger = logging.getLogger(__name__)
+
+ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
 # --- SMALI CONTENT CONSTANTS ---
 
@@ -515,34 +518,213 @@ FETCHTASK_SMALI = """
 .end method
 """
 
+def _extract_return_type(method_sig):
+    """
+    Extract the Smali return type from a '.method' declaration line.
+    Fallback to 'V' (void) if parsing fails.
+    """
+    m = re.search(r"\)([^ ]+)", method_sig)
+    if not m:
+        return "V"
+    return m.group(1)
+
+def _build_stub_body(return_type):
+    """
+    Build a minimal, valid Smali method body that returns a default value
+    for the given return type.
+    """
+    # Void
+    if return_type == "V":
+        return [
+            "    .locals 0",
+            "    return-void",
+        ]
+
+    # Wide primitives (long, double)
+    if return_type in ("J", "D"):
+        return [
+            "    .locals 2",
+            "    const-wide/16 v0, 0x0",
+            "    return-wide v0",
+        ]
+
+    # Object / array
+    if return_type.startswith("L") or return_type.startswith("["):
+        return [
+            "    .locals 1",
+            "    const/4 v0, 0x0",
+            "    return-object v0",
+        ]
+
+    # All other primitives (int, boolean, float, etc.)
+    return [
+        "    .locals 1",
+        "    const/4 v0, 0x0",
+        "    return v0",
+    ]
+
+def _neutralize_getmodpc_hooks(analysis):
+    """
+    For every non-GETMODPC method that references Lcom/GETMODPC/, replace the
+    entire method body with a tiny stub. This avoids ClassNotFoundExceptions
+    and keeps the host app stable even after we remove the GETMODPC package.
+    """
+    call_sites = getattr(analysis, "getmodpc_call_sites", None)
+    if not call_sites:
+        logger.info("No GETMODPC call sites detected; skipping hook neutralization.")
+        return
+
+    # Group methods by file and ignore methods that live inside com/GETMODPC itself
+    methods_by_file = {}
+    for site in call_sites:
+        normalized_path = site.file_path.replace(os.sep, "/")
+        if "com/GETMODPC" in normalized_path:
+            continue
+        methods = methods_by_file.setdefault(site.file_path, set())
+        methods.add(site.method_signature)
+
+    for file_path, method_sigs in methods_by_file.items():
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            logger.warning("Failed to read smali file %s while stripping GETMODPC hooks: %s", file_path, exc)
+            continue
+
+        changed = False
+        new_lines = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            if stripped.startswith(".method") and stripped in method_sigs:
+                # Stub this entire method
+                return_type = _extract_return_type(stripped)
+                stub_body = _build_stub_body(return_type)
+
+                # Skip original body until '.end method'
+                i += 1
+                end_line = None
+                while i < len(lines):
+                    if lines[i].strip().startswith(".end method"):
+                        end_line = lines[i].rstrip("\n")
+                        i += 1
+                        break
+                    i += 1
+
+                if end_line is None:
+                    # Malformed method; keep original content to avoid breaking things
+                    logger.warning("Malformed method while stripping GETMODPC in %s; leaving method untouched.", file_path)
+                    new_lines.append(line)
+                    continue
+
+                new_lines.append(line.rstrip("\n") + "\n")
+                for stub_line in stub_body:
+                    new_lines.append(stub_line + "\n")
+                new_lines.append(end_line + "\n")
+                changed = True
+            else:
+                new_lines.append(line)
+                i += 1
+
+        if changed:
+            try:
+                with open(file_path, "w", encoding="utf-8") as fh:
+                    fh.writelines(new_lines)
+                logger.info("Neutralized GETMODPC hooks in %s", file_path)
+            except OSError as exc:
+                logger.warning("Failed to write stripped smali file %s: %s", file_path, exc)
+
+def _strip_getmodpc_from_manifest(decode_dir):
+    """
+    Remove any Android components (activities, services, receivers, providers,
+    meta-data) that reference GETMODPC from AndroidManifest.xml.
+    """
+    manifest_path = os.path.join(decode_dir, "AndroidManifest.xml")
+    if not os.path.exists(manifest_path):
+        return
+
+    try:
+        tree = ET.parse(manifest_path)
+        root = tree.getroot()
+        app = root.find("application")
+        if app is None:
+            return
+
+        changed = False
+
+        # Remove components whose android:name or android:value contains GETMODPC
+        for child in list(app):
+            name = child.get(f"{{{ANDROID_NS}}}name")
+            value = child.get(f"{{{ANDROID_NS}}}value")
+            if (name and "GETMODPC" in name) or (value and "GETMODPC" in value):
+                app.remove(child)
+                changed = True
+                continue
+
+            # Clean any nested meta-data tags
+            for md in list(child.findall("meta-data")):
+                md_name = md.get(f"{{{ANDROID_NS}}}name") or ""
+                md_value = md.get(f"{{{ANDROID_NS}}}value") or ""
+                if "GETMODPC" in md_name or "GETMODPC" in md_value:
+                    child.remove(md)
+                    changed = True
+
+        # Application-level meta-data
+        for md in list(app.findall("meta-data")):
+            md_name = md.get(f"{{{ANDROID_NS}}}name") or ""
+            md_value = md.get(f"{{{ANDROID_NS}}}value") or ""
+            if "GETMODPC" in md_name or "GETMODPC" in md_value:
+                app.remove(md)
+                changed = True
+
+        if changed:
+            tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+            logger.info("Stripped GETMODPC entries from AndroidManifest.xml")
+    except Exception as exc:
+        logger.warning("Failed to strip GETMODPC from AndroidManifest.xml: %s", exc)
+
 def apply_mods(decode_dir, analysis=None):
     """
     Applies the specific SoundCloud mods:
-    1. Removes GETMODPC files.
-    2. Adds com.myupdate files.
-    3. Injects code into LauncherActivity.
 
-    Optionally accepts a precomputed `analysis` object from smali_scanner.analyze_smali_tree,
-    which will be used in future iterations to choose better injection points.
+    - Optionally neutralizes GETMODPC hooks and strips its package/libs,
+      depending on config.STRIP_GETMODPC.
+    - Optionally injects com.myupdate files and hooks them into the launcher
+      activity, depending on config.ENABLE_UPDATER.
+
+    `analysis` is the ModAnalysis result produced by smali_scanner.analyze_smali_tree.
     """
-    # 1. REMOVAL (Clean Logic)
-    # Remove smali/com/GETMODPC if exists
-    getmod_dir = os.path.join(decode_dir, "smali", "com", "GETMODPC")
-    if os.path.exists(getmod_dir):
-        logger.info(f"Removing {getmod_dir}")
-        shutil.rmtree(getmod_dir)
+    # 1. Neutralise GETMODPC hooks in host app code (before removing the package)
+    if config.STRIP_GETMODPC and analysis is not None:
+        _neutralize_getmodpc_hooks(analysis)
+        _strip_getmodpc_from_manifest(decode_dir)
 
-    # Remove libGETMODPC.so from all lib folders
-    lib_dir = os.path.join(decode_dir, "lib")
-    if os.path.exists(lib_dir):
-        for root, dirs, files in os.walk(lib_dir):
-            for file in files:
-                if "libGETMODPC.so" in file:
-                    full_path = os.path.join(root, file)
-                    logger.info(f"Removing {full_path}")
-                    os.remove(full_path)
+    # 2. REMOVAL (Clean Logic) - strip the GETMODPC package and native libs
+    if config.STRIP_GETMODPC:
+        getmod_dir = os.path.join(decode_dir, "smali", "com", "GETMODPC")
+        if os.path.exists(getmod_dir):
+            logger.info("Removing %s", getmod_dir)
+            shutil.rmtree(getmod_dir)
 
-    # 2. ADDITION (New Logic)
+        lib_dir = os.path.join(decode_dir, "lib")
+        if os.path.exists(lib_dir):
+            for root, dirs, files in os.walk(lib_dir):
+                for file in files:
+                    if "libGETMODPC.so" in file:
+                        full_path = os.path.join(root, file)
+                        logger.info("Removing %s", full_path)
+                        os.remove(full_path)
+    else:
+        logger.info("STRIP_GETMODPC is disabled; leaving com/GETMODPC package and libs intact.")
+
+    # 3. ADDITION (New Logic) - inject our own updater if enabled
+    if not config.ENABLE_UPDATER:
+        logger.info("ENABLE_UPDATER is disabled; skipping updater injection.")
+        return
+
     # Create com/myupdate directory
     new_pkg_dir = os.path.join(decode_dir, "smali", "com", "myupdate")
     os.makedirs(new_pkg_dir, exist_ok=True)
@@ -587,69 +769,57 @@ def apply_mods(decode_dir, analysis=None):
     with open(os.path.join(new_pkg_dir, "FetchTask.smali"), "w") as f:
         f.write(fetchtask_smali)
 
-    # 3. INJECTION (Activity Hook)
-    # For now we keep the original SoundCloud-specific heuristic. In the future we
-    # can use `analysis.launcher_activity` and `analysis.getmodpc_call_sites` to
-    # choose better injection points.
+    # 4. INJECTION (Activity Hook)
     launcher_path = None
-    for root, dirs, files in os.walk(decode_dir):
-        if "LauncherActivity.smali" in files:
-            # Check if it's the right one (SoundCloud specific)
-            if "soundcloud" in root:
-                launcher_path = os.path.join(root, "LauncherActivity.smali")
-                break
+
+    # Prefer the launcher activity discovered via analysis, if available
+    if analysis is not None:
+        launcher = getattr(analysis, "launcher_activity", None)
+        if launcher is not None and getattr(launcher, "smali_path", None):
+            launcher_path = launcher.smali_path
+            logger.info("Using launcher activity from analysis: %s", launcher_path)
+
+    # Fallback to the original heuristic if analysis is missing or incomplete
+    if not launcher_path:
+        for root, dirs, files in os.walk(decode_dir):
+            if "LauncherActivity.smali" in files:
+                if "soundcloud" in root:
+                    launcher_path = os.path.join(root, "LauncherActivity.smali")
+                    break
 
     if not launcher_path:
-        logger.error("LauncherActivity.smali not found!")
-        return  # Cannot inject if not found
+        logger.error("LauncherActivity.smali not found; skipping updater injection.")
+        return
 
-    logger.info(f"Injecting into {launcher_path}")
+    logger.info("Injecting updater into %s", launcher_path)
 
-    with open(launcher_path, "r") as f:
+    with open(launcher_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
-    # --- FIX: REMOVE OLD GETMODPC CALLS ---
-    # The previous mod likely injected a call like:
-    #   invoke-static {p0}, Lcom/GETMODPC/A;->...(Landroid/content/Context;)V
-    # We must remove it to prevent ClassNotFoundException
+    # As an extra safety net, strip any leftover GETMODPC lines from this file
     if "Lcom/GETMODPC" in content:
-        logger.info("Removing old GETMODPC references from LauncherActivity...")
-        # Regex to remove lines with Lcom/GETMODPC
-        # This removes the entire line containing the reference
+        logger.info("Removing old GETMODPC references from launcher activity...")
         content = re.sub(r".*Lcom\\/GETMODPC.*", "", content)
 
-    # Regex to find the onCreate method
-    # .method ... onCreate(Landroid/os/Bundle;)V ... (code) ... return-void .end method
-    #
-    # We want to insert before 'return-void' in 'onCreate'
-    # This is a simple heuristic; might need adjustment for complex methods
+    # Regex to find the onCreate method and inject our updater call just before return-void
     pattern = r"(\\.method .*? onCreate\\(Landroid\\/os\\/Bundle;\\)V)(.*?)(\\n\\s+return-void)"
 
     match = re.search(pattern, content, re.DOTALL)
 
     if match and "Lcom/myupdate/Updater;->check" not in content:
-        # Construct the replacement
-        # Group 1: method header
-        # Group 2: method body
-        # Injection
-        # Group 3: return-void
-        injection = "\n    invoke-static {p0}, Lcom/myupdate/Updater;->check(Landroid/content/Context;)V"
-
-        # We replace the found 'return-void' with 'injection + return-void'
-        # But specifically ONLY inside the Match we found
         header = match.group(1)
         body = match.group(2)
         tail = match.group(3)
 
+        injection = "\n    invoke-static {p0}, Lcom/myupdate/Updater;->check(Landroid/content/Context;)V"
+
         new_block = f"{header}{body}{injection}{tail}"
+        new_content = content.replace(match.group(0), new_block, 1)
 
-        # Replace only the first occurrence (onCreate)
-        new_content = content.replace(match.group(0), new_block)
-
-        with open(launcher_path, "w") as f:
+        with open(launcher_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        logger.info("Injection successful.")
+        logger.info("Updater injection successful.")
     else:
-        logger.warning("Could not find onCreate or code already injected.")
+        logger.warning("Could not find onCreate or updater already injected; skipping injection.")
 
