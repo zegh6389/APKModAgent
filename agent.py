@@ -3,6 +3,7 @@ import subprocess
 import shutil
 import logging
 from patcher import apply_mods
+from smali_scanner import analyze_smali_tree
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,15 +21,15 @@ class APKAgent:
         """Runs a shell command and logs output"""
         logger.info(f"Running: {' '.join(command)}")
         result = subprocess.run(
-            command, 
-            capture_output=True, 
+            command,
+            capture_output=True,
             text=True
         )
         if result.stdout:
             logger.info(result.stdout)
         if result.stderr:
             logger.error(result.stderr)
-        
+
         if check and result.returncode != 0:
             raise Exception(f"Command failed: {command} -> {result.stderr}")
         return result
@@ -41,15 +42,29 @@ class APKAgent:
             logger.info("Decompiling APK...")
             self.run_command(["apktool", "d", apk_path, "-o", self.decode_dir, "-f"])
 
-            # 2. Analyze and Apply Modifications using Patcher
-            logger.info("Applying modifications...")
-            apply_mods(self.decode_dir)
+            # 2. Analyze decompiled Smali tree (read-only)
+            analysis = None
+            try:
+                logger.info("Analyzing decompiled Smali tree...")
+                analysis = analyze_smali_tree(self.decode_dir)
+                logger.info(
+                    "Analysis summary: GETMODPC present=%s, myupdate present=%s, launcher=%s",
+                    analysis.getmodpc_present,
+                    analysis.myupdate_present,
+                    analysis.launcher_activity.name if analysis.launcher_activity else "None",
+                )
+            except Exception as analysis_exc:
+                logger.error(f"Smali analysis failed: {analysis_exc}")
 
-            # 3. Recompile
+            # 3. Apply Modifications using Patcher
+            logger.info("Applying modifications...")
+            apply_mods(self.decode_dir, analysis=analysis)
+
+            # 4. Recompile
             logger.info("Recompiling APK...")
             self.run_command(["apktool", "b", self.decode_dir, "-o", self.output_apk])
 
-            # 4. Align and Sign
+            # 5. Align and Sign
             logger.info("Aligning APK...")
             aligned_apk = os.path.join(self.work_dir, "aligned.apk")
             self.run_command([
@@ -70,7 +85,7 @@ class APKAgent:
 
             if os.path.exists(signed_apk):
                 return signed_apk
-            
+
             return None
 
         except Exception as e:
