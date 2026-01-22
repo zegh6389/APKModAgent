@@ -526,21 +526,21 @@ def apply_mods(decode_dir, analysis=None):
     which will be used in future iterations to choose better injection points.
     """
     # 1. REMOVAL (Clean Logic)
-    # Remove smali/com/GETMODPC if exists
+    # NOTE: We intentionally leave the GETMODPC classes and native libraries in place
+    # to avoid ClassNotFoundException crashes in hosts that still reference them.
+    # We only log their presence here so you can verify detection in the build logs.
     getmod_dir = os.path.join(decode_dir, "smali", "com", "GETMODPC")
     if os.path.exists(getmod_dir):
-        logger.info(f"Removing {getmod_dir}")
-        shutil.rmtree(getmod_dir)
+        logger.info(f"Detected legacy GETMODPC package at {getmod_dir}; leaving it intact")
 
-    # Remove libGETMODPC.so from all lib folders
+    # Detect (but do not remove) any GETMODPC native libraries
     lib_dir = os.path.join(decode_dir, "lib")
     if os.path.exists(lib_dir):
         for root, dirs, files in os.walk(lib_dir):
             for file in files:
-                if "libGETMODPC.so" in file:
+                if "GETMODPC" in file:
                     full_path = os.path.join(root, file)
-                    logger.info(f"Removing {full_path}")
-                    os.remove(full_path)
+                    logger.info(f"Detected legacy GETMODPC native library at {full_path}; leaving it intact")
 
     # 2. ADDITION (New Logic)
     # Create com/myupdate directory
@@ -592,12 +592,28 @@ def apply_mods(decode_dir, analysis=None):
     # can use `analysis.launcher_activity` and `analysis.getmodpc_call_sites` to
     # choose better injection points.
     launcher_path = None
-    for root, dirs, files in os.walk(decode_dir):
-        if "LauncherActivity.smali" in files:
-            # Check if it's the right one (SoundCloud specific)
-            if "soundcloud" in root:
-                launcher_path = os.path.join(root, "LauncherActivity.smali")
-                break
+
+    # Prefer manifest-based launcher resolution from the static analysis, if available.
+    if analysis and getattr(analysis, "launcher_activity", None):
+        candidate = getattr(analysis.launcher_activity, "smali_path", None)
+        if candidate and os.path.exists(candidate):
+            launcher_path = candidate
+            logger.info(f"Using launcher activity from manifest analysis: {launcher_path}")
+        else:
+            logger.warning(
+                "LauncherActivity from analysis has no valid smali path: %s",
+                getattr(analysis.launcher_activity, "smali_path", None),
+            )
+
+    # Fallback to the legacy filesystem heuristic
+    if not launcher_path:
+        for root, dirs, files in os.walk(decode_dir):
+            if "LauncherActivity.smali" in files:
+                # Check if it's the right one (SoundCloud specific)
+                if "soundcloud" in root:
+                    launcher_path = os.path.join(root, "LauncherActivity.smali")
+                    logger.info(f"Using launcher activity from filesystem scan: {launcher_path}")
+                    break
 
     if not launcher_path:
         logger.error("LauncherActivity.smali not found!")

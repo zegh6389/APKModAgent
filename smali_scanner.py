@@ -64,7 +64,7 @@ def _find_smali_roots(decode_dir: str) -> List[str]:
     return roots
 
 
-def _find_package_dirs(decode_dir: str, package_rel_path: str) -> List[strnew]:
+def _find_package_dirs(decode_dir: str, package_rel_path: str) -> List[str]:
     """Find directories for a given package, e.g. 'com/GETMODPC'."""
     matches: List[str] = []
     for root in _find_smali_roots(decode_dir):
