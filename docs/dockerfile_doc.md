@@ -1,5 +1,7 @@
 # Dockerfile Documentation
 
+**Applies to version:** 1.10
+
 **Purpose**:  
 Defines the reproducible environment required to run the agent. It essentially creates an Android modding workstation in a container.
 

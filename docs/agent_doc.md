@@ -1,5 +1,7 @@
 # agent.py Documentation
 
+**Applies to version:** 1.10
+
 **Purpose**:  
 Encapsulates the core logic for the APK build lifecycle. It bridges Python with the system-level Android tools (Apktool, Apksigner).
 
