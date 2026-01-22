@@ -563,6 +563,21 @@ def _build_stub_body(return_type):
         "    return v0",
     ]
 
+def _find_smali_roots(decode_dir):
+    """
+    Locate all smali* directories under the decoded APK root.
+    """
+    roots = []
+    try:
+        for entry in os.listdir(decode_dir):
+            if entry.startswith("smali"):
+                path = os.path.join(decode_dir, entry)
+                if os.path.isdir(path):
+                    roots.append(path)
+    except FileNotFoundError:
+        logger.warning("Decode directory does not exist: %s", decode_dir)
+    return roots
+
 def _neutralize_getmodpc_hooks(analysis):
     """
     For every non-GETMODPC method that references Lcom/GETMODPC/, replace the
@@ -637,6 +652,112 @@ def _neutralize_getmodpc_hooks(analysis):
             except OSError as exc:
                 logger.warning("Failed to write stripped smali file %s: %s", file_path, exc)
 
+def _neutralize_getmodpc_string_refs(decode_dir):
+    """
+    Find and stub any methods that reference GETMODPC classes by string,
+    e.g. const-string \"com.GETMODPC.A\" followed by reflection.
+    """
+    targets = ("com.GETMODPC.", "com/GETMODPC/")
+    smali_roots = _find_smali_roots(decode_dir)
+    if not smali_roots:
+        return
+
+    methods_by_file = {}
+
+    for root in smali_roots:
+        for dirpath, _, files in os.walk(root):
+            # Skip the GETMODPC package itself; it will be removed or replaced.
+            if f"com{os.sep}GETMODPC" in dirpath:
+                continue
+            for file in files:
+                if not file.endswith(".smali"):
+                    continue
+                full_path = os.path.join(dirpath, file)
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        current_method = ""
+                        for line in fh:
+                            stripped = line.strip()
+                            if stripped.startswith(".method"):
+                                current_method = stripped
+                                continue
+                            if not current_method:
+                                continue
+                            if any(t in line for t in targets):
+                                methods_by_file.setdefault(full_path, set()).add(current_method)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to read smali file %s while scanning for string GETMODPC references: %s",
+                        full_path,
+                        exc,
+                    )
+
+    if not methods_by_file:
+        logger.info("No string-based GETMODPC references found; skipping string neutralization.")
+        return
+
+    for file_path, method_sigs in methods_by_file.items():
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            logger.warning(
+                "Failed to read smali file %s while stubbing string GETMODPC references: %s",
+                file_path,
+                exc,
+            )
+            continue
+
+        changed = False
+        new_lines = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            if stripped.startswith(".method") and stripped in method_sigs:
+                return_type = _extract_return_type(stripped)
+                stub_body = _build_stub_body(return_type)
+
+                i += 1
+                end_line = None
+                while i < len(lines):
+                    if lines[i].strip().startswith(".end method"):
+                        end_line = lines[i].rstrip("\n")
+                        i += 1
+                        break
+                    i += 1
+
+                if end_line is None:
+                    logger.warning(
+                        "Malformed method while stubbing GETMODPC string reference in %s; leaving method untouched.",
+                        file_path,
+                    )
+                    new_lines.append(line)
+                    continue
+
+                new_lines.append(line.rstrip("\n") + "\n")
+                for stub_line in stub_body:
+                    new_lines.append(stub_line + "\n")
+                new_lines.append(end_line + "\n")
+                changed = True
+            else:
+                new_lines.append(line)
+                i += 1
+
+        if changed:
+            try:
+                with open(file_path, "w", encoding="utf-8") as fh:
+                    fh.writelines(new_lines)
+                logger.info("Neutralized GETMODPC string-based references in %s", file_path)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to write smali file %s after stubbing GETMODPC strings: %s",
+                    file_path,
+                    exc,
+                )
+
 def _strip_getmodpc_from_manifest(decode_dir):
     """
     Remove any Android components (activities, services, receivers, providers,
@@ -686,6 +807,17 @@ def _strip_getmodpc_from_manifest(decode_dir):
     except Exception as exc:
         logger.warning("Failed to strip GETMODPC from AndroidManifest.xml: %s", exc)
 
+STUB_GETMODPC_A_SMALI = """
+.class public Lcom/GETMODPC/A;
+.super Ljava/lang/Object;
+
+.method public constructor <init>()V
+    .locals 0
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+"""
+
 def apply_mods(decode_dir, analysis=None):
     """
     Applies the specific SoundCloud mods:
@@ -698,8 +830,10 @@ def apply_mods(decode_dir, analysis=None):
     `analysis` is the ModAnalysis result produced by smali_scanner.analyze_smali_tree.
     """
     # 1. Neutralise GETMODPC hooks in host app code (before removing the package)
-    if config.STRIP_GETMODPC and analysis is not None:
-        _neutralize_getmodpc_hooks(analysis)
+    if config.STRIP_GETMODPC:
+        if analysis is not None:
+            _neutralize_getmodpc_hooks(analysis)
+        _neutralize_getmodpc_string_refs(decode_dir)
         _strip_getmodpc_from_manifest(decode_dir)
 
     # 2. REMOVAL (Clean Logic) - strip the GETMODPC package and native libs
@@ -717,6 +851,18 @@ def apply_mods(decode_dir, analysis=None):
                         full_path = os.path.join(root, file)
                         logger.info("Removing %s", full_path)
                         os.remove(full_path)
+
+        # Recreate a minimal stub class to satisfy any remaining reflective lookups.
+        stub_dir = os.path.join(decode_dir, "smali", "com", "GETMODPC")
+        os.makedirs(stub_dir, exist_ok=True)
+        stub_path = os.path.join(stub_dir, "A.smali")
+        if not os.path.exists(stub_path):
+            try:
+                with open(stub_path, "w", encoding="utf-8") as fh:
+                    fh.write(STUB_GETMODPC_A_SMALI)
+                logger.info("Created stub class %s to satisfy reflective GETMODPC lookups.", stub_path)
+            except OSError as exc:
+                logger.warning("Failed to write stub GETMODPC class %s: %s", stub_path, exc)
     else:
         logger.info("STRIP_GETMODPC is disabled; leaving com/GETMODPC package and libs intact.")
 
