@@ -3,6 +3,8 @@ import shutil
 import re
 import logging
 
+import config
+
 logger = logging.getLogger(__name__)
 
 # --- SMALI CONTENT CONSTANTS ---
@@ -513,21 +515,23 @@ FETCHTASK_SMALI = """
 .end method
 """
 
-def apply_mods(decode_dir):
+def apply_mods(decode_dir, analysis=None):
     """
     Applies the specific SoundCloud mods:
     1. Removes GETMODPC files.
     2. Adds com.myupdate files.
     3. Injects code into LauncherActivity.
+
+    Optionally accepts a precomputed `analysis` object from smali_scanner.analyze_smali_tree,
+    which will be used in future iterations to choose better injection points.
     """
-    
     # 1. REMOVAL (Clean Logic)
     # Remove smali/com/GETMODPC if exists
     getmod_dir = os.path.join(decode_dir, "smali", "com", "GETMODPC")
     if os.path.exists(getmod_dir):
         logger.info(f"Removing {getmod_dir}")
         shutil.rmtree(getmod_dir)
-    
+
     # Remove libGETMODPC.so from all lib folders
     lib_dir = os.path.join(decode_dir, "lib")
     if os.path.exists(lib_dir):
@@ -543,17 +547,50 @@ def apply_mods(decode_dir):
     new_pkg_dir = os.path.join(decode_dir, "smali", "com", "myupdate")
     os.makedirs(new_pkg_dir, exist_ok=True)
 
+    # Prepare templated Smali content using config values
+    updater_smali = UPDATER_SMALI
+    updater_smali = updater_smali.replace(
+        "https://your-website.com/update_config.json",
+        config.UPDATE_URL,
+    )
+    updater_smali = updater_smali.replace(
+        "https://t.me/YourTelegramChannel",
+        config.TELEGRAM_URL,
+    )
+    updater_smali = updater_smali.replace(
+        "Welcome!",
+        config.WELCOME_TITLE,
+    )
+    updater_smali = updater_smali.replace(
+        "Thanks for using our Mod. Join us on Telegram for updates!",
+        config.WELCOME_MESSAGE,
+    )
+    updater_smali = updater_smali.replace(
+        "Update Available",
+        config.UPDATE_DIALOG_TITLE,
+    )
+    updater_smali = updater_smali.replace(
+        "A new version is available. check our telegram channel",
+        config.UPDATE_DIALOG_MESSAGE,
+    )
+
+    fetchtask_smali = FETCHTASK_SMALI.replace(
+        "https://your-website.com/update_config.json",
+        config.UPDATE_URL,
+    )
+
     # Write the new Smali files
     with open(os.path.join(new_pkg_dir, "Updater.smali"), "w") as f:
-        f.write(UPDATER_SMALI)
+        f.write(updater_smali)
     with open(os.path.join(new_pkg_dir, "Updater$1.smali"), "w") as f:
         f.write(UPDATER_INNER_SMALI)
     with open(os.path.join(new_pkg_dir, "FetchTask.smali"), "w") as f:
-        f.write(FETCHTASK_SMALI)
+        f.write(fetchtask_smali)
 
     # 3. INJECTION (Activity Hook)
-    # Locate LauncherActivity.smali
-    # We scan recursively because it might be in different smali_classes folders
+    # For now we keep the original SoundCloud-specific heuristic. In the future we
+    # can use `analysis.launcher_activity` and `analysis.getmodpc_call_sites` to
+    # choose better injection points.
     launcher_path = None
     for root, dirs, files in os.walk(decode_dir):
         if "LauncherActivity.smali" in files:
@@ -561,59 +598,57 @@ def apply_mods(decode_dir):
             if "soundcloud" in root:
                 launcher_path = os.path.join(root, "LauncherActivity.smali")
                 break
-    
+
     if not launcher_path:
         logger.error("LauncherActivity.smali not found!")
-        return # Cannot inject if not found
+        return  # Cannot inject if not found
 
     logger.info(f"Injecting into {launcher_path}")
-    
+
     with open(launcher_path, "r") as f:
         content = f.read()
 
     # --- FIX: REMOVE OLD GETMODPC CALLS ---
-    # The previous mod likely injected a call like: invoke-static {p0}, Lcom/GETMODPC/A;->...(Landroid/content/Context;)V
+    # The previous mod likely injected a call like:
+    #   invoke-static {p0}, Lcom/GETMODPC/A;->...(Landroid/content/Context;)V
     # We must remove it to prevent ClassNotFoundException
     if "Lcom/GETMODPC" in content:
         logger.info("Removing old GETMODPC references from LauncherActivity...")
         # Regex to remove lines with Lcom/GETMODPC
         # This removes the entire line containing the reference
-        content = re.sub(r".*Lcom\/GETMODPC.*", "", content)
+        content = re.sub(r".*Lcom\\/GETMODPC.*", "", content)
 
     # Regex to find the onCreate method
     # .method ... onCreate(Landroid/os/Bundle;)V ... (code) ... return-void .end method
-    
+    #
     # We want to insert before 'return-void' in 'onCreate'
     # This is a simple heuristic; might need adjustment for complex methods
-    
-    pattern = r"(\.method .*? onCreate\(Landroid\/os\/Bundle;\)V)(.*?)(\n\s+return-void)"
-    
+    pattern = r"(\\.method .*? onCreate\\(Landroid\\/os\\/Bundle;\\)V)(.*?)(\\n\\s+return-void)"
+
     match = re.search(pattern, content, re.DOTALL)
-    
+
     if match and "Lcom/myupdate/Updater;->check" not in content:
         # Construct the replacement
         # Group 1: method header
         # Group 2: method body
         # Injection
         # Group 3: return-void
-        
         injection = "\n    invoke-static {p0}, Lcom/myupdate/Updater;->check(Landroid/content/Context;)V"
-        
+
         # We replace the found 'return-void' with 'injection + return-void'
         # But specifically ONLY inside the Match we found
-        
         header = match.group(1)
         body = match.group(2)
         tail = match.group(3)
-        
+
         new_block = f"{header}{body}{injection}{tail}"
-        
+
         # Replace only the first occurrence (onCreate)
         new_content = content.replace(match.group(0), new_block)
-        
+
         with open(launcher_path, "w") as f:
             f.write(new_content)
-        
+
         logger.info("Injection successful.")
     else:
         logger.warning("Could not find onCreate or code already injected.")
